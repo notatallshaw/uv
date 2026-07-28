@@ -25,8 +25,8 @@ use uv_distribution::{ArchiveMetadata, DistributionDatabase};
 use uv_distribution_types::{
     BuiltDist, CompatibleDist, DerivationChain, Dist, DistErrorKind, Identifier, IncompatibleDist,
     IncompatibleSource, IncompatibleWheel, IndexCapabilities, IndexLocations, IndexMetadata,
-    IndexUrl, InstalledDist, Name, PythonRequirementKind, RemoteSource, Requirement, ResolvedDist,
-    ResolvedDistRef, SourceDist, VersionOrUrlRef, implied_markers,
+    IndexUrl, InstalledDist, Name, PrioritizedDist, PythonRequirementKind, RemoteSource,
+    Requirement, ResolvedDist, ResolvedDistRef, SourceDist, VersionOrUrlRef, implied_markers,
 };
 use uv_git::GitResolver;
 use uv_normalize::{ExtraName, GroupName, PackageName};
@@ -697,6 +697,9 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                             dependencies,
                             &self.index,
                             &self.installed_packages,
+                            &self.overrides,
+                            &self.excludes,
+                            self.options.torch_backend.as_ref(),
                         );
                     }
                     ForkedDependencies::Forked {
@@ -1007,6 +1010,9 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                     fork.dependencies,
                     &self.index,
                     &self.installed_packages,
+                    &self.overrides,
+                    &self.excludes,
+                    self.options.torch_backend.as_ref(),
                 );
 
                 Ok(forked_state)
@@ -3300,8 +3306,9 @@ impl ForkState {
 
     /// Adds the dependencies for the selected version of the current package.
     ///
-    /// For registry packages, the depending version is widened across gaps containing no other
-    /// known version before its incompatibilities are added. Packages without a complete registry
+    /// For registry packages, the depending version is first extended across the adjacent known
+    /// versions that share its dependencies, then widened across gaps containing no other known
+    /// version, before its incompatibilities are added. Packages without a complete registry
     /// version map retain the selected version's singleton range.
     fn add_package_version_dependencies<InstalledPackages: InstalledPackagesProvider>(
         &mut self,
@@ -3310,6 +3317,9 @@ impl ForkState {
         dependencies: Vec<PubGrubDependency>,
         index: &InMemoryIndex,
         installed_packages: &InstalledPackages,
+        overrides: &Overrides,
+        excludes: &Excludes,
+        torch_backend: Option<&TorchStrategy>,
     ) {
         for dependency in &dependencies {
             let PubGrubDependency {
@@ -3332,9 +3342,21 @@ impl ForkState {
             );
         }
 
-        // Widen across gaps so rejected adjacent versions merge into contiguous ranges rather
-        // than leaving one hole per version.
-        let versions = Range::singleton(for_version.clone());
+        // Extend the decided version across the adjacent versions that share its dependencies, so
+        // a run of versions is decided once instead of once per version, then widen across gaps so
+        // rejected adjacent versions merge into contiguous ranges rather than leaving one hole per
+        // version.
+        let package = &self.pubgrub.package_store[self.next];
+        let spannable = spannable_package(package).filter(|name| {
+            // Scoped overrides and exclusions, and the CUDA system dependencies, key on the version
+            // being resolved, so the dependencies are not a function of the metadata alone.
+            !overrides.has_version_scope(name)
+                && !excludes.has_version_scope(name)
+                && !torch_backend.is_some_and(|torch_backend| {
+                    matches!(torch_backend, TorchStrategy::Cuda { .. })
+                        && torch_backend.has_system_dependency(name)
+                })
+        });
         let versions = if let Some(known_versions) =
             ResolverState::<InstalledPackages>::known_versions(
                 index,
@@ -3342,15 +3364,26 @@ impl ForkState {
                 &self.fork_urls,
                 &self.fork_indexes,
                 &mut self.known_versions,
-                &self.pubgrub.package_store[self.next],
+                package,
             )
             .filter(|versions| !versions.is_empty())
         {
-            versions.widen_versions(known_versions)
+            let (lower, upper) = spannable.map_or((for_version, for_version), |name| {
+                same_dependency_span(
+                    name,
+                    for_version,
+                    known_versions,
+                    &self.pins,
+                    &self.fork_indexes,
+                    index,
+                    installed_packages,
+                )
+            });
+            Range::from_range_bounds(lower.clone()..=upper.clone()).widen_versions(known_versions)
         } else {
             // A decided version is always selectable and thus in the list, but an empty list
             // would unsoundly widen to the full range.
-            versions
+            Range::singleton(for_version.clone())
         };
         let conflict = self.pubgrub.add_package_version_dependencies(
             self.next,
@@ -3759,6 +3792,158 @@ impl ForkState {
             env: self.env,
         }
     }
+}
+
+/// The name of a package whose dependencies are a function of its metadata alone, if this is one.
+///
+/// The extra and group variants of [`PubGrubPackageInner::Package`], and the proxy packages, pin
+/// their dependencies to the selected version by construction, so their sets can only be widened
+/// across gaps. The marker is ignored because [`ResolverState::get_dependencies`] ignores it.
+fn spannable_package(package: &PubGrubPackage) -> Option<&PackageName> {
+    match &**package {
+        PubGrubPackageInner::Package {
+            name,
+            extra: None,
+            group: None,
+            marker: _,
+        } => Some(name),
+        _ => None,
+    }
+}
+
+/// Whether two versions of `name` have the same dependencies, given their metadata.
+///
+/// Dependency evaluation for a plain package node reads the requirement list and the
+/// `Requires-Python` of the distribution the fork selects, so equal metadata gives equal
+/// dependencies. The exception is a requirement on the package's own name, which
+/// [`ResolverState::flatten_requirements`] expands against the package's own version; such a
+/// package is excluded rather than compared.
+///
+/// The requirement lists are compared in order, which can only shorten a run.
+fn same_dependencies(
+    name: &PackageName,
+    left: (&[Requirement], Option<&VersionSpecifiers>),
+    right: (&[Requirement], Option<&VersionSpecifiers>),
+) -> bool {
+    let (left_requires_dist, left_requires_python) = left;
+    let (right_requires_dist, right_requires_python) = right;
+    left_requires_python == right_requires_python
+        && left_requires_dist == right_requires_dist
+        && !left_requires_dist
+            .iter()
+            .any(|requirement| requirement.name == *name)
+}
+
+/// Extend `for_version` across the adjacent entries of `known_versions` accepted by `same_deps`.
+///
+/// Returns the inclusive bounds of the run, which are `for_version` twice when both neighbors are
+/// rejected. The walk stops on each side at the first rejected version, so every known version
+/// strictly inside the returned bounds was accepted.
+fn same_dependency_run<'a>(
+    known_versions: &'a [Version],
+    for_version: &'a Version,
+    mut same_deps: impl FnMut(&Version) -> bool,
+) -> (&'a Version, &'a Version) {
+    let Ok(position) = known_versions.binary_search(for_version) else {
+        return (for_version, for_version);
+    };
+    let lower = known_versions[..position]
+        .iter()
+        .rev()
+        .take_while(|version| same_deps(version))
+        .last()
+        .unwrap_or(for_version);
+    let upper = known_versions[position + 1..]
+        .iter()
+        .take_while(|version| same_deps(version))
+        .last()
+        .unwrap_or(for_version);
+    (lower, upper)
+}
+
+/// Extend a decided version across the adjacent known versions with the same dependencies.
+///
+/// A version joins the run only if the fork resolves it to a single registry distribution whose
+/// metadata is already in the shared index and matches the decided version's. The walk never waits
+/// for a fetch and never requests one, so an unfetched, errored or divergent neighbor bounds the
+/// run; only the interval between the bounds is claimed to share the decided version's
+/// dependencies.
+fn same_dependency_span<'a, InstalledPackages: InstalledPackagesProvider>(
+    name: &PackageName,
+    for_version: &'a Version,
+    known_versions: &'a [Version],
+    pins: &FilePins,
+    fork_indexes: &ForkIndexes,
+    index: &InMemoryIndex,
+    installed_packages: &InstalledPackages,
+) -> (&'a Version, &'a Version) {
+    // The decided version's metadata is the one the resolver pinned for it.
+    let Some((_, metadata_id)) = pins.dist_and_id(name, for_version) else {
+        return (for_version, for_version);
+    };
+    let Some(response) = index.distributions().get(metadata_id) else {
+        return (for_version, for_version);
+    };
+    let MetadataResponse::Found(archive) = &*response else {
+        return (for_version, for_version);
+    };
+    let metadata = &archive.metadata;
+
+    let versions_response = if let Some(index_metadata) = fork_indexes.get(name) {
+        index
+            .explicit()
+            .get(&(name.clone(), index_metadata.url().clone()))
+    } else {
+        index.implicit().get(name)
+    };
+    let Some(versions_response) = versions_response else {
+        return (for_version, for_version);
+    };
+    let VersionsResponse::Found(version_maps) = &*versions_response else {
+        return (for_version, for_version);
+    };
+
+    // An installed distribution shadows the registry distribution for its own version, and its
+    // metadata is not the metadata read below.
+    let installed_dists = installed_packages.get_packages(name);
+
+    same_dependency_run(known_versions, for_version, |version| {
+        if installed_dists.iter().any(|dist| dist.version() == version) {
+            return false;
+        }
+
+        // The distribution the fork would select must be unambiguous, which it is not when the
+        // version exists on more than one index.
+        let mut selected = None;
+        for version_map in version_maps {
+            if let Some(prioritized_dist) = version_map.get(version)
+                && selected.replace(prioritized_dist).is_some()
+            {
+                return false;
+            }
+        }
+        let Some(dist) = selected.and_then(PrioritizedDist::get) else {
+            return false;
+        };
+
+        let Some(response) = index
+            .distributions()
+            .get(&dist.for_resolution().distribution_id())
+        else {
+            return false;
+        };
+        let MetadataResponse::Found(archive) = &*response else {
+            return false;
+        };
+        same_dependencies(
+            name,
+            (&metadata.requires_dist, metadata.requires_python.as_ref()),
+            (
+                &archive.metadata.requires_dist,
+                archive.metadata.requires_python.as_ref(),
+            ),
+        )
+    })
 }
 
 /// The resolution from a single fork including the virtual packages and the edges between them.
@@ -4532,4 +4717,268 @@ struct ConflictTracker {
     ///
     /// Distilled from `culprit` for fast checking in the hot loop.
     deprioritize: Vec<Id<PubGrubPackage>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use uv_distribution_types::Requirement;
+    use uv_normalize::{ExtraName, GroupName, PackageName};
+    use uv_pep440::{Version, VersionSpecifiers};
+    use uv_pep508::MarkerTree;
+
+    use crate::pubgrub::{PubGrubPackage, PubGrubPackageInner, PubGrubPython, Range};
+
+    use super::{same_dependencies, same_dependency_run, spannable_package};
+
+    fn package_name(name: &str) -> PackageName {
+        PackageName::from_str(name).expect("valid package name")
+    }
+
+    fn version(version: &str) -> Version {
+        Version::from_str(version).expect("valid version")
+    }
+
+    fn versions(versions: &[&str]) -> Vec<Version> {
+        versions.iter().copied().map(version).collect()
+    }
+
+    fn requirement(requirement: &str) -> Requirement {
+        Requirement::from(uv_pep508::Requirement::from_str(requirement).expect("valid requirement"))
+    }
+
+    fn requirements(requirements: &[&str]) -> Vec<Requirement> {
+        requirements.iter().copied().map(requirement).collect()
+    }
+
+    fn requires_python(specifiers: &str) -> VersionSpecifiers {
+        VersionSpecifiers::from_str(specifiers).expect("valid version specifiers")
+    }
+
+    #[test]
+    fn plain_packages_are_spannable() {
+        let package = PubGrubPackage::from(PubGrubPackageInner::Package {
+            name: package_name("anyio"),
+            extra: None,
+            group: None,
+            marker: MarkerTree::TRUE,
+        });
+        assert_eq!(spannable_package(&package), Some(&package_name("anyio")));
+
+        // The marker is ignored, since dependency retrieval ignores it too.
+        let marker_variant = PubGrubPackage::from(PubGrubPackageInner::Package {
+            name: package_name("anyio"),
+            extra: None,
+            group: None,
+            marker: MarkerTree::FALSE,
+        });
+        assert_eq!(
+            spannable_package(&marker_variant),
+            Some(&package_name("anyio"))
+        );
+    }
+
+    #[test]
+    fn extras_and_groups_are_not_spannable() {
+        let extra_variant = PubGrubPackage::from(PubGrubPackageInner::Package {
+            name: package_name("anyio"),
+            extra: Some(ExtraName::from_str("trio").expect("valid extra name")),
+            group: None,
+            marker: MarkerTree::TRUE,
+        });
+        assert_eq!(spannable_package(&extra_variant), None);
+
+        let group_variant = PubGrubPackage::from(PubGrubPackageInner::Package {
+            name: package_name("anyio"),
+            extra: None,
+            group: Some(GroupName::from_str("dev").expect("valid group name")),
+            marker: MarkerTree::TRUE,
+        });
+        assert_eq!(spannable_package(&group_variant), None);
+
+        for package in [
+            PubGrubPackageInner::Root(None),
+            PubGrubPackageInner::Python(PubGrubPython::Target),
+            PubGrubPackageInner::System(package_name("cuda")),
+            PubGrubPackageInner::Extra {
+                name: package_name("anyio"),
+                extra: ExtraName::from_str("trio").expect("valid extra name"),
+                marker: MarkerTree::TRUE,
+            },
+            PubGrubPackageInner::Group {
+                name: package_name("anyio"),
+                group: GroupName::from_str("dev").expect("valid group name"),
+                marker: MarkerTree::TRUE,
+            },
+            PubGrubPackageInner::Marker {
+                name: package_name("anyio"),
+                marker: MarkerTree::TRUE,
+            },
+        ] {
+            assert_eq!(spannable_package(&PubGrubPackage::from(package)), None);
+        }
+    }
+
+    #[test]
+    fn identical_metadata_has_the_same_dependencies() {
+        let name = package_name("botocore");
+        let left = requirements(&["jmespath>=0.7.1,<2.0.0", "urllib3>=1.25.4,<1.27"]);
+        let right = requirements(&["jmespath>=0.7.1,<2.0.0", "urllib3>=1.25.4,<1.27"]);
+        let target = requires_python(">=3.8");
+
+        assert!(same_dependencies(
+            &name,
+            (&left, Some(&target)),
+            (&right, Some(&target))
+        ));
+        assert!(same_dependencies(&name, (&left, None), (&right, None)));
+    }
+
+    #[test]
+    fn diverging_metadata_has_different_dependencies() {
+        let name = package_name("botocore");
+        let left = requirements(&["jmespath>=0.7.1,<2.0.0", "urllib3>=1.25.4,<1.27"]);
+        let target = requires_python(">=3.8");
+
+        // A different specifier.
+        let bumped = requirements(&["jmespath>=0.7.1,<2.0.0", "urllib3>=1.25.4,<3"]);
+        assert!(!same_dependencies(
+            &name,
+            (&left, Some(&target)),
+            (&bumped, Some(&target))
+        ));
+
+        // An added requirement.
+        let added = requirements(&[
+            "jmespath>=0.7.1,<2.0.0",
+            "urllib3>=1.25.4,<1.27",
+            "python-dateutil>=2.1,<3.0.0",
+        ]);
+        assert!(!same_dependencies(
+            &name,
+            (&left, Some(&target)),
+            (&added, Some(&target))
+        ));
+
+        // A different `Requires-Python`.
+        let raised = requires_python(">=3.9");
+        assert!(!same_dependencies(
+            &name,
+            (&left, Some(&target)),
+            (&left, Some(&raised))
+        ));
+        assert!(!same_dependencies(
+            &name,
+            (&left, Some(&target)),
+            (&left, None)
+        ));
+
+        // Reordering is treated as a difference, which can only shorten a run.
+        let reordered = requirements(&["urllib3>=1.25.4,<1.27", "jmespath>=0.7.1,<2.0.0"]);
+        assert!(!same_dependencies(
+            &name,
+            (&left, Some(&target)),
+            (&reordered, Some(&target))
+        ));
+    }
+
+    #[test]
+    fn self_referential_metadata_has_no_span() {
+        let name = package_name("botocore");
+        let self_referential = requirements(&["botocore[crt]", "urllib3>=1.25.4,<1.27"]);
+
+        assert!(!same_dependencies(
+            &name,
+            (&self_referential, None),
+            (&self_referential, None)
+        ));
+
+        // A requirement on a different package's extra is fine.
+        let other = requirements(&["boto3[crt]", "urllib3>=1.25.4,<1.27"]);
+        assert!(same_dependencies(&name, (&other, None), (&other, None)));
+    }
+
+    #[test]
+    fn a_run_extends_over_accepted_neighbors() {
+        let known_versions = versions(&["1.0", "1.1", "1.2", "1.3", "1.4"]);
+        let for_version = version("1.2");
+
+        let (lower, upper) = same_dependency_run(&known_versions, &for_version, |_| true);
+        assert_eq!((lower, upper), (&version("1.0"), &version("1.4")));
+    }
+
+    #[test]
+    fn a_run_fences_at_the_first_rejected_neighbor() {
+        let known_versions = versions(&["1.0", "1.1", "1.2", "1.3", "1.4"]);
+        let for_version = version("1.2");
+
+        // A rejected version bounds the run on its side, and a version beyond it is not reached.
+        let (lower, upper) = same_dependency_run(&known_versions, &for_version, |candidate| {
+            *candidate != version("1.0") && *candidate != version("1.4")
+        });
+        assert_eq!((lower, upper), (&version("1.1"), &version("1.3")));
+
+        // Rejecting the immediate neighbors leaves the decided version alone, which is what an
+        // unfetched or errored neighbor produces.
+        let (lower, upper) = same_dependency_run(&known_versions, &for_version, |_| false);
+        assert_eq!((lower, upper), (&version("1.2"), &version("1.2")));
+
+        // A version accepted beyond a rejected one is not reached.
+        let (lower, upper) = same_dependency_run(&known_versions, &for_version, |candidate| {
+            *candidate != version("1.1")
+        });
+        assert_eq!((lower, upper), (&version("1.2"), &version("1.4")));
+    }
+
+    #[test]
+    fn a_run_of_one_widens_as_a_singleton() {
+        let known_versions = versions(&["1.0", "1.1", "1.2"]);
+        let for_version = version("1.1");
+
+        let (lower, upper) = same_dependency_run(&known_versions, &for_version, |_| false);
+        assert_eq!(
+            Range::from_range_bounds(lower.clone()..=upper.clone()),
+            Range::singleton(for_version.clone())
+        );
+        assert_eq!(
+            Range::from_range_bounds(lower.clone()..=upper.clone()).widen_versions(&known_versions),
+            Range::singleton(for_version.clone()).widen_versions(&known_versions)
+        );
+    }
+
+    #[test]
+    fn a_run_widens_to_the_versions_outside_it() {
+        let known_versions = versions(&["1.0", "1.1", "1.2", "1.3", "1.4"]);
+        let for_version = version("1.2");
+
+        let (lower, upper) = same_dependency_run(&known_versions, &for_version, |candidate| {
+            *candidate != version("1.0") && *candidate != version("1.4")
+        });
+        let widened =
+            Range::from_range_bounds(lower.clone()..=upper.clone()).widen_versions(&known_versions);
+        for known_version in &known_versions {
+            assert_eq!(
+                widened.contains(known_version),
+                *known_version != version("1.0") && *known_version != version("1.4"),
+                "{known_version}"
+            );
+        }
+
+        // Widening the whole universe reaches the unbounded ends.
+        let (lower, upper) = same_dependency_run(&known_versions, &for_version, |_| true);
+        assert_eq!(
+            Range::from_range_bounds(lower.clone()..=upper.clone()).widen_versions(&known_versions),
+            Range::full()
+        );
+    }
+
+    #[test]
+    fn an_unknown_version_has_no_run() {
+        let known_versions = versions(&["1.0", "1.2"]);
+        let for_version = version("1.1");
+
+        let (lower, upper) = same_dependency_run(&known_versions, &for_version, |_| true);
+        assert_eq!((lower, upper), (&version("1.1"), &version("1.1")));
+    }
 }
