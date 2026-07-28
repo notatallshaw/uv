@@ -700,6 +700,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                             &self.overrides,
                             &self.excludes,
                             self.options.torch_backend.as_ref(),
+                            true,
                         );
                     }
                     ForkedDependencies::Forked {
@@ -1013,6 +1014,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                     &self.overrides,
                     &self.excludes,
                     self.options.torch_backend.as_ref(),
+                    false,
                 );
 
                 Ok(forked_state)
@@ -3320,6 +3322,7 @@ impl ForkState {
         overrides: &Overrides,
         excludes: &Excludes,
         torch_backend: Option<&TorchStrategy>,
+        allow_span: bool,
     ) {
         for dependency in &dependencies {
             let PubGrubDependency {
@@ -3347,16 +3350,19 @@ impl ForkState {
         // rejected adjacent versions merge into contiguous ranges rather than leaving one hole per
         // version.
         let package = &self.pubgrub.package_store[self.next];
-        let spannable = spannable_package(package).filter(|name| {
-            // Scoped overrides and exclusions, and the CUDA system dependencies, key on the version
-            // being resolved, so the dependencies are not a function of the metadata alone.
-            !overrides.has_version_scope(name)
-                && !excludes.has_version_scope(name)
-                && !torch_backend.is_some_and(|torch_backend| {
-                    matches!(torch_backend, TorchStrategy::Cuda { .. })
-                        && torch_backend.has_system_dependency(name)
-                })
-        });
+        let spannable = allow_span
+            .then(|| spannable_package(package))
+            .flatten()
+            .filter(|name| {
+                // Scoped overrides and exclusions, and the CUDA system dependencies, key on the version
+                // being resolved, so the dependencies are not a function of the metadata alone.
+                !overrides.has_version_scope(name)
+                    && !excludes.has_version_scope(name)
+                    && !torch_backend.is_some_and(|torch_backend| {
+                        matches!(torch_backend, TorchStrategy::Cuda { .. })
+                            && torch_backend.has_system_dependency(name)
+                    })
+            });
         let versions = if let Some(known_versions) =
             ResolverState::<InstalledPackages>::known_versions(
                 index,
