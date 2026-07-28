@@ -104,6 +104,16 @@ impl Excludes {
         self.global.contains(name)
     }
 
+    /// Return whether a package has exclusions that apply to some versions but not others.
+    ///
+    /// A scope without a version applies uniformly, so only exact-version scopes make the applied
+    /// exclusions depend on the version being resolved.
+    pub fn has_version_scope(&self, package: &PackageName) -> bool {
+        self.scoped
+            .get(package)
+            .is_some_and(|entries| entries.iter().any(|entry| entry.version.is_some()))
+    }
+
     /// Check if a dependency is excluded from a specific package version.
     pub fn contains_for(
         &self,

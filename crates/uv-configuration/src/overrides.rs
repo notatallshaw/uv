@@ -226,6 +226,16 @@ impl Overrides {
             .flat_map(|scoped| scoped.overrides.values().flatten())
     }
 
+    /// Return whether a package has overrides that apply to some versions but not others.
+    ///
+    /// A scope without a version applies uniformly, so only exact-version scopes make the applied
+    /// overrides depend on the version being resolved.
+    pub fn has_version_scope(&self, package: &PackageName) -> bool {
+        self.scoped
+            .get(package)
+            .is_some_and(|entries| entries.iter().any(|entry| entry.version.is_some()))
+    }
+
     /// Return whether a package has overrides for an exact version.
     pub(crate) fn has_exact_scope(&self, package: &PackageName, version: &Version) -> bool {
         self.scoped.get(package).is_some_and(|entries| {
