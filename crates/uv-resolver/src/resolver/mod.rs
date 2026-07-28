@@ -3368,7 +3368,7 @@ impl ForkState {
             )
             .filter(|versions| !versions.is_empty())
         {
-            let (lower, upper) = spannable.map_or((for_version, for_version), |name| {
+            let (_lower, _upper) = spannable.map_or((for_version, for_version), |name| {
                 same_dependency_span(
                     name,
                     for_version,
@@ -3379,7 +3379,10 @@ impl ForkState {
                     installed_packages,
                 )
             });
-            Range::from_range_bounds(lower.clone()..=upper.clone()).widen_versions(known_versions)
+            // Walk-only measurement build: the run is computed and discarded, so the recorded set
+            // is the base's gap-widened singleton.
+            Range::from_range_bounds(for_version.clone()..=for_version.clone())
+                .widen_versions(known_versions)
         } else {
             // A decided version is always selectable and thus in the list, but an empty list
             // would unsoundly widen to the full range.
