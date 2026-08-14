@@ -5,7 +5,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use either::Either;
-use itertools::Itertools;
 use petgraph::Graph;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
@@ -36,6 +35,26 @@ fn newly_activated_extras<'lock>(
             (!activated_extras.contains(&key)).then_some(key)
         })
         .collect()
+}
+
+type ActivatedExtra<'lock> = (&'lock PackageName, &'lock ExtraName);
+
+/// Return the first two of `conflict_set`'s extras that are activated, the pair the caller
+/// reports as a conflict.
+///
+/// `ConflictSet` and `activated_extras` are both ordered by package then extra, so this is the
+/// same pair the previous scan over every activated pair reported.
+fn find_activated_conflict<'set>(
+    conflict_set: &'set ConflictSet,
+    activated_extras: &BTreeSet<ActivatedExtra<'_>>,
+) -> Option<(ActivatedExtra<'set>, ActivatedExtra<'set>)> {
+    let mut activated = conflict_set.iter().filter_map(|item| {
+        let extra = item.extra()?;
+        activated_extras
+            .contains(&(item.package(), extra))
+            .then_some((item.package(), extra))
+    });
+    Some((activated.next()?, activated.next()?))
 }
 
 /// Record another condition under which a locked package and optional extra are reachable.
@@ -706,30 +725,20 @@ trait InstallableExt<'lock>: Installable<'lock> {
                     }
                 }
             }
-            // At time of writing, it's somewhat expected that the set of
-            // conflicting extras is pretty small. With that said, the
-            // time complexity of the following routine is pretty gross.
-            // Namely, `set.contains` is linear in the size of the set,
-            // iteration over all conflicts is also obviously linear in
-            // the number of conflicting sets and then for each of those,
-            // we visit every possible pair of activated extra from above,
-            // which is quadratic in the total number of extras enabled. I
-            // believe the simplest improvement here, if it's necessary, is
-            // to adjust the `Conflicts` internals to own these sorts of
-            // checks. ---AG
-            for set in self.lock().conflicts().iter() {
-                for ((pkg1, extra1), (pkg2, extra2)) in
-                    activated_extras_set.iter().tuple_combinations()
-                {
-                    if set.contains(pkg1, *extra1) && set.contains(pkg2, *extra2) {
-                        return Err(LockErrorKind::ConflictingExtra {
-                            package1: (*pkg1).clone(),
-                            extra1: (*extra1).clone(),
-                            package2: (*pkg2).clone(),
-                            extra2: (*extra2).clone(),
-                        }
-                        .into());
+            if activated_extras_set.len() >= 2 {
+                for set in self.lock().conflicts().iter() {
+                    let Some(((package1, extra1), (package2, extra2))) =
+                        find_activated_conflict(set, &activated_extras_set)
+                    else {
+                        continue;
+                    };
+                    return Err(LockErrorKind::ConflictingExtra {
+                        package1: package1.clone(),
+                        extra1: extra1.clone(),
+                        package2: package2.clone(),
+                        extra2: extra2.clone(),
                     }
+                    .into());
                 }
             }
         }
@@ -1016,12 +1025,14 @@ mod tests {
     use std::str::FromStr;
     use std::sync::LazyLock;
 
+    use itertools::Itertools;
     use petgraph::visit::EdgeRef;
     use uv_configuration::{DependencyGroups, ExtrasSpecification};
     use uv_distribution_types::Name;
     use uv_normalize::{DefaultExtras, DefaultGroups};
     use uv_pep508::{MarkerEnvironment, MarkerEnvironmentBuilder};
     use uv_platform_tags::{Arch, Os, Platform, TagsOptions};
+    use uv_pypi_types::ConflictItem;
     use uv_warnings::anstream;
 
     use super::*;
@@ -1067,6 +1078,61 @@ mod tests {
             sys_platform,
         })
         .expect("valid marker environment")
+    }
+
+    /// The scan `find_activated_conflict` replaced: every pair of activated extras, tested
+    /// against the conflict set.
+    fn activated_conflict_by_pairs<'names>(
+        conflict_set: &ConflictSet,
+        activated_extras: &BTreeSet<(&'names PackageName, &'names ExtraName)>,
+    ) -> Option<(ActivatedExtra<'names>, ActivatedExtra<'names>)> {
+        let activated_extras = activated_extras.iter().copied().collect::<Vec<_>>();
+        for (index, &(package1, extra1)) in activated_extras.iter().enumerate() {
+            for &(package2, extra2) in &activated_extras[index + 1..] {
+                if conflict_set.contains(package1, extra1)
+                    && conflict_set.contains(package2, extra2)
+                {
+                    return Some(((package1, extra1), (package2, extra2)));
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn activated_conflict_matches_pair_enumeration() {
+        let package_name = |value| PackageName::from_str(value).expect("valid package name");
+        let extra_name = |value| ExtraName::from_str(value).expect("valid extra name");
+        let domain = [
+            ("first", "aaa"),
+            ("first", "bbb"),
+            ("second", "ccc"),
+            ("unrelated", "unrelated"),
+        ]
+        .map(|(package, extra)| (package_name(package), extra_name(extra)));
+        let group = GroupName::from_str("group").expect("valid group name");
+        let conflict_set = ConflictSet::try_from(vec![
+            ConflictItem::from(domain[2].clone()),
+            ConflictItem::from(domain[1].clone()),
+            ConflictItem::from(domain[0].clone()),
+            ConflictItem::from((package_name("group-package"), group)),
+            ConflictItem::from(package_name("project")),
+        ])
+        .expect("valid conflict set");
+
+        for active_mask in 0..(1 << domain.len()) {
+            let activated_extras = domain
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (package, extra))| {
+                    (active_mask & (1 << index) != 0).then_some((package, extra))
+                })
+                .collect();
+            let expected = activated_conflict_by_pairs(&conflict_set, &activated_extras);
+            let actual = find_activated_conflict(&conflict_set, &activated_extras);
+
+            assert_eq!(actual, expected, "active subset {active_mask:04b}");
+        }
     }
 
     fn lock() -> Lock {
